@@ -1,7 +1,29 @@
-use alloy_consensus::constants::KECCAK_EMPTY;
-use alloy_primitives::{Address, B256, Bytes, Log, U256};
-use reth_primitives::{SealedBlock, Transaction, Bytecode};
+use alloy_consensus::{constants::KECCAK_EMPTY, Header};
+use alloy_primitives::{Address, Bytes, Log, B256, U256};
+use reth_primitives::{SealedHeader, Transaction};
+use revm::bytecode::{eip7702::Eip7702Bytecode, LegacyAnalyzedBytecode};
 use serde::{Deserialize, Serialize};
+
+/// Main bytecode structure with all variants.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+pub enum Bytecode {
+    /// EIP-7702 delegated bytecode
+    Eip7702(Eip7702Bytecode),
+    /// The bytecode has been analyzed for valid jump destinations.
+    LegacyAnalyzed(LegacyAnalyzedBytecode),
+    /// The bytecode is raw bytes.
+    LegacyRaw(Bytes),
+}
+
+impl Bytecode {
+    pub fn original_bytes(&self) -> Bytes {
+        match self {
+            Self::Eip7702(bytecode) => bytecode.raw().clone(),
+            Self::LegacyAnalyzed(bytecode) => bytecode.original_bytes(),
+            Self::LegacyRaw(bytes) => bytes.clone(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockAndReceipts {
@@ -12,6 +34,17 @@ pub struct BlockAndReceipts {
     #[serde(default)]
     pub read_precompile_calls: Vec<(Address, Vec<(ReadPrecompileInput, ReadPrecompileResult)>)>,
 }
+
+/// Sealed full block composed of the block's header and body.
+///
+/// This type uses lazy sealing to avoid hashing the header until it is needed, see also
+/// [`SealedHeader`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedBlock {
+    /// Sealed Header.
+    pub header: SealedHeader<Header>,
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EvmBlock {
@@ -85,7 +118,7 @@ pub enum EvmDb {
     },
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, Debug)]
 pub struct DbAccount {
     #[serde(rename = "i", alias = "info", default)]
     pub info: DbAccountInfo,
@@ -93,7 +126,7 @@ pub struct DbAccount {
     pub storage: Vec<(U256, U256)>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, Debug)]
 pub struct DbAccountInfo {
     #[serde(rename = "b", alias = "balance", default)]
     pub balance: U256,

@@ -19,7 +19,8 @@ alloy-eips = { version = "1.0.13", default-features = false }
 reth-provider = { path = "../reth/crates/storage/provider" }
 reth-db = { path = "../reth/crates/storage/db" }
 reth-primitives = { path = "../reth/crates/primitives" }
-reth_hl = { path = "../new" }
+reth_hl = { path = "../nanoreth" }
 reth-cli-commands = { path = "../reth/crates/cli/commands" }
 reth-node-types = { path = "../reth/crates/node/types" }
 eyre = "0.6.12"
+tqdm = "0.8.0"
