@@ -94,8 +94,20 @@ pub struct AbciState {
 }
 
 #[derive(Deserialize)]
+pub struct Locus {
+    #[serde(rename = "ctx")]
+    pub context: Context,
+}
+
+#[derive(Deserialize)]
 pub struct Exchange {
+    pub locus: Locus,
     pub hyper_evm: HyperEvm,
+}
+
+#[derive(Deserialize)]
+pub struct Context {
+    pub height: u64,
 }
 
 #[derive(Deserialize)]
@@ -116,6 +128,7 @@ pub enum EvmDb {
         accounts: Vec<(Address, DbAccount)>,
         contracts: Vec<(B256, Bytecode)>,
     },
+    NoEvmDb {},
 }
 
 #[derive(Deserialize, Clone, Debug)]

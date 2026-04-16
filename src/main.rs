@@ -4,7 +4,7 @@ use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{Address, B256, U256};
 use clap::Parser;
-use evm_diff::types::{AbciState, EvmBlock, EvmDb};
+use evm_diff::types::{AbciState, DbAccountInfo, EvmBlock, EvmDb};
 use reth_cli_commands::common::{AccessRights, CliNodeTypes, EnvironmentArgs};
 use reth_db::cursor::{DbCursorRO, DbDupCursorRO};
 use reth_db::transaction::DbTx;
@@ -17,11 +17,13 @@ use reth_node_types::NodeTypesWithDBAdapter;
 use reth_primitives::{Account, Bytecode};
 use reth_provider::providers::BlockchainProvider;
 use reth_provider::{
-    AccountReader, DBProvider, DatabaseProviderFactory, ProviderFactory, ProviderResult,
+    DBProvider, DatabaseProviderFactory, ProviderFactory, ProviderResult,
     StateProvider, StateProviderFactory,
 };
-use std::collections::BTreeMap;
+use rocksdb::{Options, DB};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub fn get_reth_factory<N: CliNodeTypes<ChainSpec = HlChainSpec, Primitives = HlPrimitives>>(
@@ -97,7 +99,8 @@ pub fn extract_contract_state<P: DBProvider>(
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let Subcommands::Diff(env) = args.diff;
-    let file = File::open(args.file)?;
+    let abci_state_path: PathBuf = args.file.into();
+    let file = File::open(&abci_state_path)?;
     let mut reader = std::io::BufReader::new(file);
 
     let abci_state: AbciState = rmp_serde::decode::from_read(&mut reader)?;
@@ -106,6 +109,7 @@ fn main() -> anyhow::Result<()> {
         EvmBlock::Reth115(block) => block.header.clone(),
     };
     let block_number = header.number;
+    eprintln!("EVM block number to compare: {block_number}");
 
     let factory = get_reth_factory::<HlNode>(env).unwrap();
     let provider = BlockchainProvider::new(factory).unwrap();
@@ -113,83 +117,184 @@ fn main() -> anyhow::Result<()> {
     let state = provider
         .state_by_block_number_or_tag(BlockNumberOrTag::Number(header.number))
         .unwrap();
-    {
-        let EvmDb::InMemory {
+    match evm.state2.evm_db {
+        EvmDb::InMemory {
             accounts,
             contracts,
-        } = evm.state2.evm_db;
-        let contracts = contracts
-            .into_iter()
-            .collect::<std::collections::HashMap<_, _>>();
-        for (address, account) in tqdm::tqdm(accounts) {
-            let account_in_db = state.basic_account(&address);
-            match account_in_db {
-                Ok(Some(account_in_db)) => {
-                    assert_eq!(
-                        account_in_db.balance, account.info.balance,
-                        "{}:{}",
-                        address, block_number,
-                    );
-                    assert_eq!(account_in_db.nonce, account.info.nonce, "{}", address);
-                    assert_eq!(
-                        account_in_db.get_bytecode_hash(),
-                        account.info.code_hash,
-                        "{}:{}",
-                        address,
-                        block_number
-                    );
-
-                    let contract_state = extract_contract_state(&db_provider, &state, address)
-                        .unwrap()
-                        .unwrap();
-                    let expected = ContractState {
-                        address,
-                        account: account_in_db,
-                        bytecode: state.account_code(&address).unwrap(),
-                        storage: account
-                            .storage
-                            .into_iter()
-                            .filter(|(_, v)| v != &U256::ZERO)
-                            .map(|(k, v)| (k.into(), v.into()))
-                            .collect(),
-                    };
-                    if contract_state.storage != expected.storage {
-                        panic!(
-                            "address: {:#?}\ncontract_state: {:#?}\nexpected: {:#?}",
-                            address, contract_state, expected
-                        );
-                    }
-                }
-                Ok(Option::None) => {
-                    assert_eq!(account.info.balance, U256::ZERO);
-                    assert_eq!(account.info.nonce, 0);
-                    assert_eq!(account.info.code_hash, KECCAK_EMPTY);
-                    assert_eq!(account.storage.len(), 0);
-                }
-                Err(e) => {
-                    println!("Error getting account: {:x}: {}", address, e);
-                }
+        } => {
+            let contracts: HashMap<B256, evm_diff::types::Bytecode> = contracts.into_iter().collect();
+            let reth_contracts: HashMap<B256, Bytecode> = contracts
+                .iter()
+                .map(|(h, c)| (*h, Bytecode::new_raw(c.original_bytes())))
+                .collect();
+            for (address, account) in tqdm::tqdm(accounts) {
+                diff_account(
+                    &db_provider,
+                    &state,
+                    block_number,
+                    address,
+                    &account.info,
+                    account.storage.into_iter(),
+                );
+            }
+            for (code_hash, code) in tqdm::tqdm(reth_contracts.iter()) {
+                diff_contract(&state, *code_hash, code);
             }
         }
-        for (code_hash, code) in tqdm::tqdm(contracts) {
-            if code_hash == KECCAK_EMPTY {
-                let code_in_db = state.bytecode_by_hash(&code_hash).unwrap();
-                assert!(code_in_db.is_none() || code_in_db.unwrap().is_empty());
-                continue;
+        EvmDb::NoEvmDb {} => {
+            let home = std::env::var("HOME").unwrap();
+            let db_path = PathBuf::from(home)
+                .join("hl/hyperliquid_data/evm_db_hub_slow")
+                .join("checkpoint")
+                .join(abci_state.exchange.locus.context.height.to_string())
+                .join("EvmState");
+            println!("Opening RocksDB at {:?}", db_path);
+
+            let prefix_extractor = rocksdb::SliceTransform::create_fixed_prefix(2);
+            let mut opts = Options::default();
+            opts.set_prefix_extractor(prefix_extractor);
+            let db = DB::open(&opts, &db_path).unwrap();
+
+            let mut contracts: HashMap<B256, Bytecode> = HashMap::new();
+            for entry in db.prefix_iterator(b"\x45\x63") {
+                let entry = entry.unwrap();
+                let (key, value) = entry;
+                let code_hash = B256::from_slice(&key[2..34]);
+                let bytecode: evm_diff::types::Bytecode =
+                    rmp_serde::from_slice(&value).unwrap();
+                contracts.insert(code_hash, Bytecode::new_raw(bytecode.original_bytes()));
             }
-            let code_in_db = state.bytecode_by_hash(&code_hash).unwrap();
-            match code_in_db {
-                Some(code_in_db) => assert_eq!(code_in_db.original_bytes(), code.original_bytes()),
-                None => {
-                    if code_hash == B256::ZERO {
-                        println!("WHAT {:?}", code.original_bytes());
-                    } else {
-                        panic!("Code not found: {:x}", code_hash);
+
+            let mut storage_iterator = db.prefix_iterator(b"\x45\x73").peekable();
+            let account_iter = db.prefix_iterator(b"\x45\x61").map(|entry| {
+                let entry = entry.unwrap();
+                let (key, value) = entry;
+                let address = Address::from_slice(&key[2..22]);
+                let info: DbAccountInfo = rmp_serde::from_slice(&value).unwrap();
+                (address, info)
+            });
+
+            for (address, info) in tqdm::tqdm(account_iter.collect::<Vec<_>>()) {
+                let mut current_storage: Vec<(U256, U256)> = Vec::new();
+                loop {
+                    let Some(entry) = storage_iterator.peek() else { break };
+                    let entry = entry.as_ref().unwrap();
+                    let (key, _value) = entry;
+                    let storage_address = Address::from_slice(&key[2..22]);
+                    if storage_address != address {
+                        break;
                     }
+                    let entry = storage_iterator.next().unwrap().unwrap();
+                    let (key, value) = entry;
+                    let storage_key = B256::from_slice(&key[22..54]);
+                    let storage_value: B256 = rmp_serde::from_slice(&value).unwrap();
+                    current_storage.push((storage_key.into(), storage_value.into()));
                 }
+
+                diff_account(
+                    &db_provider,
+                    &state,
+                    block_number,
+                    address,
+                    &info,
+                    current_storage.into_iter(),
+                );
+            }
+
+            for (code_hash, code) in tqdm::tqdm(contracts.iter()) {
+                diff_contract(&state, *code_hash, code);
             }
         }
     }
 
     Ok(())
+}
+
+fn diff_account<P: DBProvider>(
+    db_provider: &P,
+    state: &dyn StateProvider,
+    block_number: u64,
+    address: Address,
+    info: &DbAccountInfo,
+    storage: impl Iterator<Item = (U256, U256)>,
+) {
+    let account_in_db = state.basic_account(&address);
+    match account_in_db {
+        Ok(Some(account_in_db)) => {
+            if account_in_db.balance != info.balance {
+                eprintln!("\x1b[1mBalance mismatch for {}\x1b[0m (block {})", address, block_number);
+                eprintln!("  \x1b[31m- reth: {}\x1b[0m", account_in_db.balance);
+                eprintln!("  \x1b[32m+ abci: {}\x1b[0m", info.balance);
+            }
+            if account_in_db.nonce != info.nonce {
+                eprintln!("\x1b[1mNonce mismatch for {}\x1b[0m", address);
+                eprintln!("  \x1b[31m- reth: {}\x1b[0m", account_in_db.nonce);
+                eprintln!("  \x1b[32m+ abci: {}\x1b[0m", info.nonce);
+            }
+            if account_in_db.get_bytecode_hash() != info.code_hash {
+                eprintln!("\x1b[1mCode hash mismatch for {}\x1b[0m (block {})", address, block_number);
+                eprintln!("  \x1b[31m- reth: {:#x}\x1b[0m", account_in_db.get_bytecode_hash());
+                eprintln!("  \x1b[32m+ abci: {:#x}\x1b[0m", info.code_hash);
+            }
+
+            let contract_state = extract_contract_state(db_provider, state, address)
+                .unwrap()
+                .unwrap();
+            let expected_storage: BTreeMap<B256, U256> = storage
+                .filter(|(_, v)| v != &U256::ZERO)
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect();
+            if contract_state.storage != expected_storage {
+                eprintln!("\x1b[1mStorage mismatch for {}\x1b[0m", address);
+                for (key, reth_val) in &contract_state.storage {
+                    match expected_storage.get(key) {
+                        Some(abci_val) if abci_val != reth_val => {
+                            eprintln!("  \x1b[33m~ {:#x}\x1b[0m", key);
+                            eprintln!("    \x1b[31m- reth: {:#x}\x1b[0m", reth_val);
+                            eprintln!("    \x1b[32m+ abci: {:#x}\x1b[0m", abci_val);
+                        }
+                        None => {
+                            eprintln!("  \x1b[31m- {:#x} = {:#x}\x1b[0m (only in reth)", key, reth_val);
+                        }
+                        _ => {}
+                    }
+                }
+                for (key, abci_val) in &expected_storage {
+                    if !contract_state.storage.contains_key(key) {
+                        eprintln!("  \x1b[32m+ {:#x} = {:#x}\x1b[0m (only in abci)", key, abci_val);
+                    }
+                }
+            }
+        }
+        Ok(None) => {
+            if info.balance != U256::ZERO || info.nonce != 0 || info.code_hash != KECCAK_EMPTY {
+                eprintln!("\x1b[1mAccount {} not found in reth but exists in abci\x1b[0m", address);
+                eprintln!("  balance: {}, nonce: {}, code_hash: {:#x}", info.balance, info.nonce, info.code_hash);
+            }
+        }
+        Err(e) => {
+            println!("Error getting account: {:x}: {}", address, e);
+        }
+    }
+}
+
+fn diff_contract(
+    state: &dyn StateProvider,
+    code_hash: B256,
+    code: &Bytecode,
+) {
+    if code_hash == KECCAK_EMPTY {
+        return;
+    }
+    let code_in_db = state.bytecode_by_hash(&code_hash).unwrap();
+    match code_in_db {
+        Some(code_in_db) => {
+            if code_in_db.original_bytes() != code.original_bytes() {
+                eprintln!("\x1b[1mBytecode mismatch for hash {:#x}\x1b[0m", code_hash);
+            }
+        }
+        None => {
+            eprintln!("\x1b[31mCode not found in reth: {:#x}\x1b[0m", code_hash);
+        }
+    }
 }
